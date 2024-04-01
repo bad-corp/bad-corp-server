@@ -9,39 +9,29 @@ import (
 	"slices"
 )
 
-func calcScore(users *[]User, comments *[]SubjectComment) map[int64]float64 {
-	dg := simple.NewDirectedGraph()
-	for _, user := range *users {
-		node := graph.Node(simple.Node(user.Id))
-		dg.AddNode(node)
-	}
+type UnitNode struct {
+	simple.Node
+	Account string `json:"account"`
+}
 
+func calcScore(comments *[]CorpComment) map[uint64]float64 {
+	var nodes []tws.Node
 	for _, comment := range *comments {
-		edge := ScoreEdge{F: simple.Node(comment.UserId), T: simple.Node(comment.SubjectIdCreator), Score: comment.Score}
-		dg.SetEdge(edge)
-	}
-
-	var d = toFullGraph(dg, 2)
-	//fmt.Printf("%+v\n", d)
-
-	var ddd []tws.Node
-	for _, dd := range d {
-		ddd = append(ddd, tws.Node{
-			RaterId:  dd.FromId,
-			TargetId: dd.ToId,
-			Deep:     dd.Deep,
-			Score:    int64(dd.Score),
+		nodes = append(nodes, tws.Node{
+			RaterId:  comment.UserId,
+			TargetId: comment.CorpId,
+			Deep:     1,
+			Score:    int64(comment.Score),
 		})
 	}
-	//fmt.Printf("%+v\n", ddd)
-	ss, _ := tws.Calc(&ddd)
-	fmt.Printf("%+v\n", ss)
+	res, _ := tws.Calc(&nodes)
+	fmt.Printf("%+v\n", res)
 
-	var a = make(map[int64]float64)
-	for k, v := range ss {
-		a[k.(int64)] = v
+	var m = make(map[uint64]float64)
+	for k, v := range res {
+		res[k.(uint64)] = v
 	}
-	return a
+	return m
 }
 
 func toFullGraph(

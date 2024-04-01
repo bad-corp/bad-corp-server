@@ -6,11 +6,11 @@ import (
 )
 
 type jwtCustomClaims struct {
-	UserId uint64 `json:"userId"`
+	UserId string `json:"userId"`
 	jwt.RegisteredClaims
 }
 
-func makeToken(userId uint64) (string, time.Time, error) {
+func makeToken(userId string) (string, time.Time, error) {
 	var expiresAt = jwt.NewNumericDate(time.Now().Add(time.Hour * 24))
 	claims := &jwtCustomClaims{
 		userId,

@@ -1,12 +1,14 @@
 package main
 
 import (
+	"github.com/google/uuid"
 	"github.com/labstack/echo/v4"
 	log "github.com/sirupsen/logrus"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 	"net/http"
 	"strconv"
+	"strings"
 )
 
 type (
@@ -24,8 +26,10 @@ func (ctl *controller) signUp(c echo.Context) error {
 	}
 
 	// 注册
+	u, _ := uuid.NewV7()
+	account := strings.ReplaceAll(u.String(), "-", "")
 	user := User{
-		Account:  body.Account,
+		Account:  account,
 		Password: body.Password,
 	}
 	result := ctl.db.Create(&user)
@@ -34,19 +38,23 @@ func (ctl *controller) signUp(c echo.Context) error {
 	}
 
 	// 登录
-	res, err := loginService(user.Id)
+	token, expiredTime, err := loginService(user.Account)
 	if err != nil {
 		return echo.ErrInternalServerError
 	}
 
-	return c.JSON(http.StatusCreated, res)
+	return c.JSON(http.StatusCreated, AuthToken{
+		Token:       token,
+		ExpiredTime: expiredTime,
+		Account:     account,
+	})
 }
 
-func getUserId(c echo.Context) (uint64, bool) {
-	if c.Get("userId") == nil {
-		return 0, false
+func getUserId(c echo.Context) (string, bool) {
+	if c.Get("userId") == nil || c.Get("userId") == "" {
+		return "", false
 	}
-	return uint64(c.Get("userId").(uint64)), true
+	return c.Get("userId").(string), true
 }
 
 func (ctl *controller) signIn(c echo.Context) error {
@@ -63,74 +71,45 @@ func (ctl *controller) signIn(c echo.Context) error {
 	}
 
 	// 登录
-	res, err := loginService(user.Id)
+	token, expiredTime, err := loginService(user.Account)
 	if err != nil {
 		return echo.ErrInternalServerError
 	}
 
-	return c.JSON(http.StatusOK, res)
+	return c.JSON(http.StatusOK, AuthToken{
+		Token:       token,
+		ExpiredTime: expiredTime,
+		Account:     user.Account,
+	})
 }
 
-func (ctl *controller) createSubject(c echo.Context) error {
-	var userId, ok = getUserId(c)
-	if !ok {
-		return echo.ErrUnauthorized
-	}
+func (ctl *controller) searchCorp(c echo.Context) error {
+	query := c.QueryParams()
 
-	var body CreateSubjectDTO
-	err := c.Bind(&body)
-	if err != nil {
+	var corps []Corp
+	_ = ctl.db.
+		Where("name LIKE ?", query.Get("name")+"%").
+		Scopes(Paginate(c.Request())).
+		Find(&corps)
+
+	return c.JSON(http.StatusOK, corps)
+}
+
+func (ctl *controller) getCorp(c echo.Context) error {
+	corpId, err := strconv.ParseInt(c.Param("corp_id"), 10, 64)
+	if err != nil || corpId <= 0 {
 		return echo.ErrBadRequest
 	}
 
-	var subject = Subject{
-		Name:      body.Name,
-		CreatedBy: userId,
-	}
-	result := ctl.db.Create(&subject)
-	if result.Error != nil {
-		return echo.ErrInternalServerError
-	}
+	var corp Corp
+	_ = ctl.db.
+		Where("id = ?").
+		First(&corp)
 
-	return c.JSON(http.StatusOK, subject)
+	return c.JSON(http.StatusOK, corp)
 }
 
-func (ctl *controller) getSubjectByRandom(c echo.Context) error {
-	var userId, ok = getUserId(c)
-	if !ok {
-		return echo.ErrUnauthorized
-	}
-
-	bloom := getInitBloom(ctl.db, userId)
-	done := false
-	offset := 0
-	for !done {
-		var subjects []Subject
-		result := ctl.db.Where("created_by <> ?", userId).Order("id desc").Limit(100).Offset(offset).Find(&subjects)
-		if len(subjects) == 0 {
-			return c.JSON(http.StatusNoContent, nil)
-		}
-		if result.Error != nil {
-			return echo.ErrNotFound
-		}
-		for _, subject := range subjects {
-			var sId = uint64ToBytes(uint64(subject.Id))
-			var read = bloom.Test(sId)
-			if !read {
-				bloom.Add(sId)
-				// saveDB
-				upsertBloom(ctl.db, bloom, userId)
-				done = true
-				return c.JSON(http.StatusOK, subject)
-			}
-		}
-		offset += 100
-	}
-
-	return c.JSON(http.StatusNoContent, nil)
-}
-
-func (ctl *controller) createSubjectComment(c echo.Context) error {
+func (ctl *controller) createCorpComment(c echo.Context) error {
 	var userId, ok = getUserId(c)
 	if !ok {
 		return echo.ErrUnauthorized
@@ -141,38 +120,47 @@ func (ctl *controller) createSubjectComment(c echo.Context) error {
 	if err != nil {
 		return echo.ErrBadRequest
 	}
-	subjectId, err := strconv.ParseInt(c.Param("subjectId"), 10, 64)
-	if err != nil || subjectId <= 0 {
+	corpId, err := strconv.ParseInt(c.Param("corp_id"), 10, 64)
+	if err != nil || corpId <= 0 {
 		return echo.ErrBadRequest
 	}
-	// TODO: 验证subjectId是否存在
+	// TODO: 验证 corpId 是否存在
 
-	var subject Subject
-	result := ctl.db.Where("id = ?", subjectId).First(&subject)
+	var corp Corp
+	result := ctl.db.Where("id = ?", corpId).First(&corp)
 	if result.RowsAffected == 0 {
 		return echo.ErrNotFound
 	}
 
-	var comment SubjectComment
-	result2 := ctl.db.Where(&SubjectComment{UserId: userId, SubjectIdCreator: subject.CreatedBy}).First(&comment)
+	// TODO: 锁
+	var comment CorpComment
+	result2 := ctl.db.Where(&CorpComment{UserId: userId, CorpId: corp.Id}).First(&comment)
 	if result2.RowsAffected > 0 {
-		var t1 = comment.C + 1
-		var t2 = int32(comment.Score) * comment.C
-		var t3 = t2 + int32(body.Score)
-		comment.Score = int8(t3 / t1)
-		comment.C += 1
+		var s, sc = score(comment.Score, body.Score, comment.ScoreCount)
+		var s2, sc2 = score(comment.Score2, body.Score2, comment.ScoreCount2)
+		var s3, sc3 = score(comment.Score3, body.Score3, comment.ScoreCount3)
+		comment.Score = s
+		comment.ScoreCount = sc
+		comment.Score = s2
+		comment.ScoreCount = sc2
+		comment.Score = s3
+		comment.ScoreCount = sc3
 		ctl.db.Clauses(clause.OnConflict{
-			Columns:   []clause.Column{{Name: "user_id"}, {Name: "subject_id_creator"}},
-			DoUpdates: clause.AssignmentColumns([]string{"score", "c"}),
+			Columns:   []clause.Column{{Name: "user_id"}, {Name: "corp_id"}},
+			DoUpdates: clause.AssignmentColumns([]string{"score", "c", "score2", "c2", "score3", "c3"}),
 		}).Create(&comment)
 	} else {
-		result3 := ctl.db.Create(&SubjectComment{
-			UserId:           userId,
-			SubjectId:        subjectId,
-			SubjectIdCreator: subject.CreatedBy,
-			Score:            body.Score,
-			C:                1,
-		})
+		comment = CorpComment{
+			UserId:      userId,
+			CorpId:      corp.Id,
+			Score:       body.Score,
+			ScoreCount:  1,
+			Score2:      body.Score2,
+			ScoreCount2: 1,
+			Score3:      body.Score3,
+			ScoreCount3: 1,
+		}
+		result3 := ctl.db.Create(&comment)
 		if result3.Error != nil {
 			return echo.ErrInternalServerError
 		}
@@ -183,39 +171,22 @@ func (ctl *controller) createSubjectComment(c echo.Context) error {
 	return c.JSON(http.StatusOK, comment)
 }
 
-type SubjectHot struct {
-	SubjectId int64 `json:"subject_id"`
-	Score     int64 `json:"score"`
-}
+func (ctl *controller) getTrendingCorps(c echo.Context) error {
+	queryTrendingType := c.QueryParam("type")
+	var trendingType string
+	if queryTrendingType == "asc" {
+		trendingType = queryTrendingType
+	} else {
+		trendingType = "desc"
+	}
 
-func (ctl *controller) getTrendingKings(c echo.Context) error {
-	var userScores []UserScore
-	result := ctl.db.Order("score desc").Limit(100).Find(&userScores)
+	var corpScores []CorpScore
+	result := ctl.db.Order("score " + trendingType).Limit(100).Find(&corpScores)
 	if result.Error != nil {
 		return echo.ErrNotFound
 	}
 
-	return c.JSON(http.StatusOK, userScores)
-}
-
-func (ctl *controller) getTrendingQueens(c echo.Context) error {
-	var userScores []UserScore
-	result := ctl.db.Order("score desc").Limit(100).Find(&userScores)
-	if result.Error != nil {
-		return echo.ErrNotFound
-	}
-
-	return c.JSON(http.StatusOK, userScores)
-}
-
-func (ctl *controller) getTrendingSubjects(c echo.Context) error {
-	var res = []SubjectHot{
-		{
-			SubjectId: 1,
-			Score:     120,
-		},
-	}
-	return c.JSON(http.StatusOK, res)
+	return c.JSON(http.StatusOK, corpScores)
 }
 
 func (ctl *controller) getUser(c echo.Context) error {
@@ -225,37 +196,13 @@ func (ctl *controller) getUser(c echo.Context) error {
 	}
 
 	var user User
-	result := ctl.db.Where(&User{Id: userId}).First(&user)
+	result := ctl.db.Where(&User{Account: userId}).First(&user)
 	if result.Error != nil {
 		return echo.ErrNotFound
 	}
 
-	var (
-		province = Resource{
-			Id: uint64(user.Province),
-		}
-		city = Resource{
-			Id: uint64(user.City),
-		}
-		district = Resource{
-			Id: uint64(user.District),
-		}
-	)
-	if user.District != 0 {
-		var areaInfo = getAreaInfo(user.Province, user.City, user.District)
-		province.Name = areaInfo[0]
-		city.Name = areaInfo[1]
-		district.Name = areaInfo[2]
-	}
-
 	return c.JSON(http.StatusOK, UserDTO{
-		Id:        user.Id,
 		Account:   user.Account,
-		Gender:    user.Gender,
-		Name:      user.Name,
-		Province:  province,
-		City:      city,
-		District:  district,
 		CreatedAt: user.CreatedAt,
 	})
 }
